@@ -7,7 +7,7 @@ from typing import Tuple, Optional, Union
 
 
 # Type hint shortcut: tells us its a numpy array of float types
-FloatArray = npt.NDArray[np.float64]
+FloatArray = npt.ArrayLike
 RandomState = np.random.RandomState 
 
 class GeneralizedGamma:
