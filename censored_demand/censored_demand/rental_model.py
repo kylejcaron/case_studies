@@ -13,7 +13,7 @@ class RentalInventory:
 	"""
 	def __init__(self, n_products: int = 1, policies: np.ndarray = None):
 		self.n_products = n_products
-		self.policies = policies or np.zeros(10000)
+		self.policies = policies if policies is not None else np.zeros((n_products, 10000))
 		# Rentals that are out with customers are stored as an array, where the index corresponds with time, 
 		# and the value corresponds with the number of rentals from that time that are still out with customers
 		# max_periods is the total number of periods to log
@@ -60,7 +60,7 @@ class RentalInventory:
 		state_next['existing_rentals'] = numpyro.deterministic("existing_rentals", state['existing_rentals'] - returns + rentals)
 		return state_next, rentals
 
-	def returns_model(self, existing_rentals, time):
+	def returns_model(self, existing_rentals: jnp.array, time: int) -> jnp.array:
 		"""Models the number of returns each date
 		"""
 		theta = numpyro.sample("theta", dist.Normal(2.9, 0.01))
@@ -68,14 +68,14 @@ class RentalInventory:
 		return_dist = dist.LogNormal(theta, sigma)
 
 		# Calculate the discrete hazard of rented out inventory from previous time-points being returned
-		discrete_hazards = self.survival_convolution(dist=return_dist)
+		discrete_hazards = self.survival_convolution(dist=return_dist, time=time)
 
 		# Simulate returns from hazards
 		returns = numpyro.sample("returns", dist.Binomial(existing_rentals.astype("int32"), probs=discrete_hazards))
 		total_returns = numpyro.deterministic("total_returns", returns.sum())
 		return returns
 
-	def survival_convolution(self, dist) -> jnp.array:
+	def survival_convolution(self, dist, time: int) -> jnp.array:
 		"""Calculates the hazard rate of a return from all past time periods, returning an array where each index is a previous time period,
 		and the value is the probability of a rental from that time being returned at the current date.
 		"""
