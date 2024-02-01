@@ -93,11 +93,7 @@ class RentalInventory:
 	def demand_model(self, available_stock, time):
 		"""Models the true demand each day.
 		"""
-		lambd = numpyro.sample("lambd", dist.Normal(10, 0.01))
-		unconstrained_rentals = numpyro.sample("unconstrained_rentals", dist.Poisson(lambd))
-		rentals = numpyro.deterministic("rentals", jnp.clip(unconstrained_rentals, a_min=0, a_max=available_stock ))
-		rentals_as_arr = ( time == jnp.arange(self.max_periods) )*rentals
-		return rentals_as_arr
+		raise NotImplementedError()
 
 	@staticmethod
 	def hazard_func(t, dist):
@@ -108,3 +104,62 @@ class RentalInventory:
 	def apply_policy(self, time):
 		return self.policies[time]
 
+	@staticmethod
+	def censored_multinomial(n, U_j, stock_j):
+		"""This implements a series of multinomial choices under inventory constraints
+		"""
+		eps=1e-10
+		stock = stock_j.copy()
+		results = jnp.zeros(stock_j.shape[0])
+		
+		while n > 0:
+			avl_idx = jnp.where(stock>0, 1, 0)
+			p_j = jax.nn.softmax(U_j, where=avl_idx, initial=0)
+			# except:
+			#     return stock, avl_idx
+			nchoices = int(min(stock[avl_idx==1].min(), n))
+			# print(nchoices, stock[avl_idx==1].min(), n)
+			# if stock[avl_idx].min() == 0:
+			#     print(stock[avl_idx].max())
+			#     return stock, avl_idx
+
+			choices = jax.random.categorical(random.PRNGKey(1), np.log(p_j+eps), shape=(nchoices,))
+			choices = (choices == jnp.arange(stock.shape[0])[:,None]).sum(1)
+			results += choices
+			stock -= choices            
+			n -= choices.sum()
+		return results
+	
+
+class PoissonDemandInventory(RentalInventory):
+	"""A model of rental inventory, modeling stock levels as returns and rentals occur each day.
+	Currently supports a single product
+	"""
+	def __init__(self, n_products: int = 1, policies: np.ndarray = None):
+		super().__init__(n_products, policies)
+
+	def demand_model(self, available_stock, time):
+		"""Models the true demand each day.
+		"""
+		lambd = numpyro.sample("lambd", dist.Normal(10, 0.01))
+		unconstrained_rentals = numpyro.sample("unconstrained_rentals", dist.Poisson(lambd))
+		rentals = numpyro.deterministic("rentals", jnp.clip(unconstrained_rentals, a_min=0, a_max=available_stock ))
+		rentals_as_arr = ( time == jnp.arange(self.max_periods) )*rentals
+		return rentals_as_arr
+
+
+class MultinomialDemandInventory(RentalInventory):
+	"""A model of rental inventory, modeling stock levels as returns and rentals occur each day.
+	Currently supports a single product
+	"""
+	def __init__(self, n_products: int = 1, policies: np.ndarray = None):
+		super().__init__(n_products, policies)
+
+	def demand_model(self, available_stock, time):
+		"""Models the true demand each day.
+		"""
+		lambd = numpyro.sample("lambd", dist.Normal(10, 0.01))
+		unconstrained_rentals = numpyro.sample("unconstrained_rentals", dist.Poisson(lambd))
+		rentals = numpyro.deterministic("rentals", jnp.clip(unconstrained_rentals, a_min=0, a_max=available_stock ))
+		rentals_as_arr = ( time == jnp.arange(self.max_periods) )*rentals
+		return rentals_as_arr
