@@ -1,4 +1,6 @@
 from typing import Dict, Tuple
+from functools import partial
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -13,7 +15,7 @@ class RentalInventory:
 	"""
 	def __init__(self, n_products: int = 1, policies: np.ndarray = None):
 		self.n_products = n_products
-		self.policies = policies if policies is not None else np.zeros((n_products, 10000))
+		self.policies = policies if policies is not None else jnp.zeros((n_products, 10000))
 		# Rentals that are out with customers are stored as an array, where the index corresponds with time, 
 		# and the value corresponds with the number of rentals from that time that are still out with customers
 		# max_periods is the total number of periods to log
@@ -52,11 +54,11 @@ class RentalInventory:
 
 		# Simulate Returns
 		returns = self.returns_model(state['existing_rentals'], time)
-		state_next['starting_stock'] = numpyro.deterministic("starting_stock", state['ending_stock']+returns.sum() + self.apply_policy(time))
+		state_next['starting_stock'] = numpyro.deterministic("starting_stock", state['ending_stock'] + returns.sum(1) + self.apply_policy(time))
 
 		# Simulate Rentals, incorporate them into the next state
 		rentals = self.demand_model(available_stock=state_next['starting_stock'], time=time)
-		state_next['ending_stock'] = numpyro.deterministic("ending_stock", state_next['starting_stock'] - rentals.sum())
+		state_next['ending_stock'] = numpyro.deterministic("ending_stock", state_next['starting_stock'] - rentals.sum(1))
 		state_next['existing_rentals'] = numpyro.deterministic("existing_rentals", state['existing_rentals'] - returns + rentals)
 		return state_next, rentals
 
@@ -72,7 +74,7 @@ class RentalInventory:
 
 		# Simulate returns from hazards
 		returns = numpyro.sample("returns", dist.Binomial(existing_rentals.astype("int32"), probs=discrete_hazards))
-		total_returns = numpyro.deterministic("total_returns", returns.sum())
+		total_returns = numpyro.deterministic("total_returns", returns.sum(1))
 		return returns
 
 	def survival_convolution(self, dist, time: int) -> jnp.array:
@@ -102,34 +104,41 @@ class RentalInventory:
 		return (dist.cdf(t+1)-dist.cdf(t))/(1-dist.cdf(t))
 
 	def apply_policy(self, time):
-		return self.policies[time]
+		return self.policies[:,time]
 
 	@staticmethod
 	def censored_multinomial(n, U_j, stock_j):
-		"""This implements a series of multinomial choices under inventory constraints
+		"""This implements a series of iterative multinomial choices under inventory constraints
 		"""
-		eps=1e-10
+		
 		stock = stock_j.copy()
 		results = jnp.zeros(stock_j.shape[0])
+		key = jax.random.PRNGKey(1)
+		state = (key, n, U_j, stock, results)
 		
-		while n > 0:
+		def while_choices_left(state): 
+			_,n,_,_,_ = state
+			return n > 0
+		
+		@partial(jax.jit, static_argnums=(0))
+		def sim_choices(state):
+			eps=1e-10
+			key,n,U_j,stock,results = state
+			new_key, subkey = jax.random.split(key)
 			avl_idx = jnp.where(stock>0, 1, 0)
 			p_j = jax.nn.softmax(U_j, where=avl_idx, initial=0)
-			# except:
-			#     return stock, avl_idx
-			nchoices = int(min(stock[avl_idx==1].min(), n))
-			# print(nchoices, stock[avl_idx==1].min(), n)
-			# if stock[avl_idx].min() == 0:
-			#     print(stock[avl_idx].max())
-			#     return stock, avl_idx
-
-			choices = jax.random.categorical(random.PRNGKey(1), np.log(p_j+eps), shape=(nchoices,))
-			choices = (choices == jnp.arange(stock.shape[0])[:,None]).sum(1)
+			# min_stock = jnp.where(avl_idx==1, stock, jnp.inf).min()
+			# nchoices = jnp.minimum(min_stock, n).astype(int)
+			choices = dist.Multinomial(total_count=1, probs=p_j, total_count_max=1).sample(subkey)
 			results += choices
 			stock -= choices            
 			n -= choices.sum()
-		return results
+			return (new_key, n,U_j,stock,results)
+
+		state = jax.lax.while_loop(while_choices_left, sim_choices, init_val=state)
+		return state[-1]
 	
+
 
 class PoissonDemandInventory(RentalInventory):
 	"""A model of rental inventory, modeling stock levels as returns and rentals occur each day.
@@ -141,10 +150,11 @@ class PoissonDemandInventory(RentalInventory):
 	def demand_model(self, available_stock, time):
 		"""Models the true demand each day.
 		"""
-		lambd = numpyro.sample("lambd", dist.Normal(10, 0.01))
+		with numpyro.plate("n_products", self.n_products):
+			lambd = numpyro.sample("lambd", dist.Normal(10, 0.01))
 		unconstrained_rentals = numpyro.sample("unconstrained_rentals", dist.Poisson(lambd))
 		rentals = numpyro.deterministic("rentals", jnp.clip(unconstrained_rentals, a_min=0, a_max=available_stock ))
-		rentals_as_arr = ( time == jnp.arange(self.max_periods) )*rentals
+		rentals_as_arr = ( time == jnp.arange(self.max_periods) )*rentals[:,None]
 		return rentals_as_arr
 
 
@@ -158,8 +168,15 @@ class MultinomialDemandInventory(RentalInventory):
 	def demand_model(self, available_stock, time):
 		"""Models the true demand each day.
 		"""
-		lambd = numpyro.sample("lambd", dist.Normal(10, 0.01))
-		unconstrained_rentals = numpyro.sample("unconstrained_rentals", dist.Poisson(lambd))
-		rentals = numpyro.deterministic("rentals", jnp.clip(unconstrained_rentals, a_min=0, a_max=available_stock ))
-		rentals_as_arr = ( time == jnp.arange(self.max_periods) )*rentals
-		return rentals_as_arr
+		# Hyperparameters
+		lambd_total = numpyro.sample("lambd", dist.Normal(5000, 0.01))
+		with numpyro.plate("n_products", self.n_products):
+			utility = numpyro.sample("utility", dist.Gumbel(0, 0.5))
+
+		# Generative model
+		total_rentals = numpyro.sample("total_rentals", dist.Poisson(lambd_total))
+		# unconstrained_rentals = numpyro.sample("unconstrained_rentals", dist.Poisson(jnp.exp(utility)))
+		rentals = numpyro.deterministic("rentals", 
+					RentalInventory.censored_multinomial(n=total_rentals, U_j=utility, stock_j=available_stock)
+		)
+		return rentals
