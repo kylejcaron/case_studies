@@ -5,14 +5,40 @@ so fake records are made afterwards from the simulated results.
 The code is pretty ugly, I'd recommend not reading into this too much. 
 """
 from typing import Tuple
+import sys
+import argparse
 import pandas as pd
 import numpy as np
 import uuid
-
 import jax
 import jax.numpy as jnp
 import numpyro
-from censored_demand.rental_model import PoissonDemandInventory
+from censored_demand.rental_model import PoissonDemandInventory, MultinomialDemandInventory
+from tqdm import tqdm
+
+parser = argparse.ArgumentParser()
+parser.add_argument(			
+	"--demand_type", 
+	"-d",
+	default='multinomial',
+	type=str,
+	help="The model type. Can be poisson or multinomial"
+)
+
+
+def simulate_buy_amounts(utility, j_products, min_buy=20, max_buy=300):
+    """This function simulates semi-informed buy amounts - 80% the time the buy is correlated to utility (but typically underbought)
+    and the rest of the time the buy is randomly informed
+    """
+    X = np.random.gamma( utility+np.abs(utility.min()) + 5 ,0.2,size=j_products)
+    semi_informed_depth=(min_buy + X/X.max()*max_buy) // 10*10
+
+    is_informed_buy = np.random.binomial(1, 0.8, size=j_products)
+    random_depth = np.random.choice(range(min_buy, max_buy+1,10), size=j_products)
+    buy_amounts = np.where(is_informed_buy==True, semi_informed_depth, random_depth)
+    return buy_amounts
+    
+
 
 def make_pseudo_rental_data(results, start_date='2022-04-01'):
 	"""This takes a simulation results dictionary and converts it into pseudo realistic data
@@ -23,15 +49,15 @@ def make_pseudo_rental_data(results, start_date='2022-04-01'):
 
 	all_stock_data = []
 	all_rental_events = []
-	for j in range(j_products):
+	for j in tqdm(range(j_products),total=j_products):
 		daily_rentals = results['rentals'][...,j].ravel().astype(int)
 
 		# Make a fake stock level dataset
 		stock_data = pd.DataFrame({
-			"product_id":f"product_{j}",
-			"date":dates, 
-			"units":results['starting_stock'][...,j].ravel(),
-			"ending_units":results['ending_stock'][...,j].ravel()
+			"product_id": f"product_{j}",
+			"date": dates, 
+			"starting_units": results['starting_stock'][...,j].ravel(),
+			"ending_units": results['ending_stock'][...,j].ravel()
 		})
 
 		# Generate fake rental events
@@ -61,6 +87,7 @@ def make_pseudo_rental_data(results, start_date='2022-04-01'):
 
 	return pd.concat(all_stock_data), pd.concat(all_rental_events)
 
+
 def generate_rental_events(rentals, date) -> pd.DataFrame:
 	"""Takes an count of rentals that occurred on a given date and generates
 	fake entries for each one. 
@@ -75,6 +102,7 @@ def generate_rental_events(rentals, date) -> pd.DataFrame:
 		# leave the date that the rental is returned as null
 		.assign(return_date=pd.NaT)
 	)
+
 
 def update_records_with_returns(
 	rental_events: pd.DataFrame, 
@@ -98,33 +126,85 @@ def update_records_with_returns(
 
 		# update that entry as having been returned on the inputted date
 		rental_events.loc[idx, "return_date"] = date
-	
 
 
 if __name__ == '__main__':
+	args = vars(parser.parse_args())
+
 	T = 100
-	j_products = 250
-	np.random.seed(1)
-	rental_model = PoissonDemandInventory(n_products=j_products)
+	j_products = 1000
+	dates = pd.date_range('2022-04-01', periods=T, freq='D')
+
+	print("Defining the inventory model....")
+	# Simulate a reorder policy
+	rng = np.random.default_rng(seed=99)
+	reorder_amt = rng.choice(range(0,100+1,50), p=[0.9, 0.075,0.025], size=j_products)
+	reorder_policy = (jnp.arange(T) == 60)*reorder_amt[:,None]
+
+	# Declare the inventory model for simulation
+	if args['demand_type'] == 'poisson':
+		rental_inventory= PoissonDemandInventory(n_products=j_products, policies=reorder_policy)
+	elif args['demand_type'] == 'multinomial':
+		rental_inventory= MultinomialDemandInventory(n_products=j_products, policies=reorder_policy)
+	else:
+		raise ValueError("demand type must be one of [poisson, multinomial]")
+
+	# Choose initial depths for each product
+	initial_depth = simulate_buy_amounts(rental_inventory.U, j_products, min_buy = 25, max_buy=250)
+
 	init_state = {
-		"starting_stock":jnp.ones((j_products))*100,
-		"ending_stock":jnp.ones((j_products))*100,
+		"starting_stock": initial_depth,
+		"ending_stock": initial_depth,
 		# No pre-existing rentals for this product at the start of the simulation
 		"existing_rentals": np.zeros((j_products,10000)),
 	}
-
-	# The products had a reorder at t=40
-	reorder_amt = np.random.choice(range(0,160,10), size=j_products)
-	reorder_policy = (jnp.arange(T) == 40)*reorder_amt[:,None]
-
+	
+	print("Simulating Rental and Stock Activity....")
 	# Simulate demand and stock for the product
-	rental_inventory= PoissonDemandInventory(n_products=j_products, policies=reorder_policy)
 	pred_fn = numpyro.infer.Predictive(
 		rental_inventory.model, 
 		num_samples = 1,
 	)
 	results = pred_fn(jax.random.PRNGKey(1), init_state, 0, T)
-	stock_data, rental_events = make_pseudo_rental_data(results, start_date = '2022-04-01')
 
+	print("Making pseudo-realistic records....")
+	stock_data, rental_events = make_pseudo_rental_data(results, start_date = dates[0])
+
+	print("Saving Results....")
 	stock_data.to_csv("./data/stock_levels.csv", index=None)
 	rental_events.to_csv("./data/rentals.csv", index=None)
+
+	# Save purchase records
+	pd.concat((
+		
+		# initial order volumes
+		pd.DataFrame({
+			"product_id":[f"product_{j}" for j in range(j_products)],
+			"units":initial_depth,
+			"date": dates[0],
+			"order_type":"new_product"
+		}),
+		# reorder volumes
+		pd.DataFrame({
+			"product_id":[f"product_{j}" for j in range(j_products)],
+			"units":reorder_amt,
+			"date": dates[60],
+			"order_type":"reorder"
+		}).loc[lambda d: d.units>0],
+	
+	)).to_csv("./data/product_purchases.csv", index=None)
+
+	# Same true parameters
+	pd.DataFrame({
+		"product_id":[f"product_{j}" for j in range(j_products)],
+		"utility":rental_inventory.U
+	}).to_csv("./data/true_params.csv", index=None)
+	
+	( 
+		pd.DataFrame(results['unconstrained_demand'].squeeze(0), index=dates)
+		.stack()
+		.reset_index()
+		.set_axis(['date', 'product_id', 'demand'],axis=1)
+		.assign(product_id = lambda d: 'product_' + d.product_id.astype(str))
+		.to_csv("./data/true_demand_daily.csv", index=None)
+	)

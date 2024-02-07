@@ -3,6 +3,7 @@ from functools import partial
 
 import numpy as np
 import jax
+from jax import random
 import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
@@ -114,6 +115,8 @@ class RentalInventory:
 		stock = stock_j.copy()
 		results = jnp.zeros(stock_j.shape[0])
 		key = jax.random.PRNGKey(1)
+		# Dont take more rentals then the total amount of stock
+		n = jnp.where(stock.sum() < n, stock.sum(), n)
 		state = (key, n, U_j, stock, results)
 		
 		def while_choices_left(state): 
@@ -133,7 +136,7 @@ class RentalInventory:
 			results += choices
 			stock -= choices            
 			n -= choices.sum()
-			return (new_key, n,U_j,stock,results)
+			return (new_key,n,U_j,stock,results)
 
 		state = jax.lax.while_loop(while_choices_left, sim_choices, init_val=state)
 		return state[-1]
@@ -146,12 +149,17 @@ class PoissonDemandInventory(RentalInventory):
 	"""
 	def __init__(self, n_products: int = 1, policies: np.ndarray = None):
 		super().__init__(n_products, policies)
+		rng = np.random.default_rng(seed=99)
+
+		# Heterogeneity in demand is lambd ~ Exp(5) distributed
+		self.U = jnp.log( 5 * rng.exponential( size=n_products) )
 
 	def demand_model(self, available_stock, time):
 		"""Models the true demand each day.
 		"""
-		with numpyro.plate("n_products", self.n_products):
-			lambd = numpyro.sample("lambd", dist.Normal(10, 0.01))
+		with numpyro.plate("n_products", self.n_products) as ind:
+			lambd = numpyro.sample("lambd", dist.Normal(jnp.exp(self.U[ind]), 0.01))
+
 		unconstrained_rentals = numpyro.sample("unconstrained_rentals", dist.Poisson(lambd))
 		rentals = numpyro.deterministic("rentals", jnp.clip(unconstrained_rentals, a_min=0, a_max=available_stock ))
 		rentals_as_arr = ( time == jnp.arange(self.max_periods) )*rentals[:,None]
@@ -164,19 +172,33 @@ class MultinomialDemandInventory(RentalInventory):
 	"""
 	def __init__(self, n_products: int = 1, policies: np.ndarray = None):
 		super().__init__(n_products, policies)
+		rng = np.random.default_rng(seed=99)
+		self.X = rng.normal(0,1,size=(n_products, 5))
+		self.beta = np.array([0.248, -0.845, -0.0385, -0.00045, 0.2795])
+		self.U = self.X.dot(self.beta) + rng.gumbel(0,0.2)
+
+		self.total_rental_rate = 5000
+
 
 	def demand_model(self, available_stock, time):
 		"""Models the true demand each day.
 		"""
 		# Hyperparameters
-		lambd_total = numpyro.sample("lambd", dist.Normal(5000, 0.01))
-		with numpyro.plate("n_products", self.n_products):
-			utility = numpyro.sample("utility", dist.Gumbel(0, 0.5))
+		lambd_total = numpyro.sample("lambd", dist.Normal(self.total_rental_rate, 0.01))
+		utility = numpyro.deterministic("utlity",self.U)
 
 		# Generative model
 		total_rentals = numpyro.sample("total_rentals", dist.Poisson(lambd_total))
-		# unconstrained_rentals = numpyro.sample("unconstrained_rentals", dist.Poisson(jnp.exp(utility)))
+
+		# Log measures of unconstrained demand
+		avl_idx = jnp.where(available_stock>0, 1, 0)
+		p_j = jax.nn.softmax(utility, where=avl_idx, initial=0)
+		_ = numpyro.deterministic("unconstrained_demand", self.total_rental_rate * p_j)
+		_ = numpyro.sample("unconstrained_rentals", dist.Multinomial(self.total_rental_rate, p_j))
+
+		# Simulate observed rentals from a censored multinomial distribution
 		rentals = numpyro.deterministic("rentals", 
-					RentalInventory.censored_multinomial(n=total_rentals, U_j=utility, stock_j=available_stock)
+			RentalInventory.censored_multinomial(n=total_rentals, U_j=utility, stock_j=available_stock)
 		)
-		return rentals
+		rentals_as_arr = ( time == jnp.arange(self.max_periods) )*rentals[:,None]
+		return rentals_as_arr.astype(int)
