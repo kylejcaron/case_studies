@@ -158,7 +158,7 @@ class PoissonDemandInventory(RentalInventory):
 		"""Models the true demand each day.
 		"""
 		with numpyro.plate("n_products", self.n_products) as ind:
-			lambd = numpyro.sample("lambd", dist.Normal(jnp.exp(self.U[ind]), 0.01))
+			lambd = numpyro.sample("lambd", dist.Normal(jnp.exp(self.U[ind]), 0.001))
 
 		unconstrained_rentals = numpyro.sample("unconstrained_rentals", dist.Poisson(lambd))
 		rentals = numpyro.deterministic("rentals", jnp.clip(unconstrained_rentals, a_min=0, a_max=available_stock ))
